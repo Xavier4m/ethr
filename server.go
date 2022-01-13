@@ -44,8 +44,13 @@ func runServer(serverParam ethrServerParam) {
 	fmt.Println("-----------------------------------------------------------")
 	showAcceptedIPVersion()
 	ui.printMsg("Listening on port %d for TCP & UDP", gEthrPort)
-	srvrRunUDPServer()
-	err := srvrRunTCPServer()
+	err := srvrRunUDPServer()
+	if err != nil {
+		finiServer()
+		fmt.Printf("Fatal error running UDP server: %v\n", err)
+		os.Exit(1)
+	}
+	err = srvrRunTCPServer()
 	if err != nil {
 		finiServer()
 		fmt.Printf("Fatal error running TCP server: %v\n", err)
