@@ -73,7 +73,12 @@ func handshakeWithClient(test *ethrTest, conn net.Conn) (testID EthrTestID, clie
 }
 
 func srvrRunTCPServer() error {
-	l, err := net.Listen(Tcp(), gLocalIP+":"+gEthrPortStr)
+	tcpAddr, err := net.ResolveTCPAddr("tcp", gLocalIP+":"+gEthrPortStr)
+	if err != nil {
+		ui.printDbg("Unable to resolve TCP address: %v", err)
+		return err
+	}
+	l, err := net.ListenTCP(Tcp(), tcpAddr)
 	if err != nil {
 		return err
 	}
