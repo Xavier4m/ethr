@@ -10,6 +10,7 @@ import (
 	"container/list"
 	"encoding/binary"
 	"encoding/gob"
+	"github.com/lucas-clemente/quic-go"
 	"io"
 	"net"
 	"os"
@@ -37,6 +38,7 @@ const (
 	TCP EthrProtocol = iota
 	UDP
 	ICMP
+	QUIC
 )
 
 const (
@@ -318,6 +320,30 @@ func createAckMsg() (ethrMsg *EthrMsg) {
 	return
 }
 
+func recvSessionMsgQUIC(stream quic.Stream) (ethrMsg *EthrMsg) {
+	ethrMsg = &EthrMsg{}
+	ethrMsg.Type = EthrInv
+	msgBytes := make([]byte, 4)
+	_, err := io.ReadFull(stream, msgBytes)
+	if err != nil {
+		ui.printDbg("Error receiving message on control channel. Error: %v", err)
+		return
+	}
+	msgSize := binary.BigEndian.Uint32(msgBytes[0:])
+	// TODO: Assuming max ethr message size as 16K sent over gob.
+	if msgSize > 16384 {
+		return
+	}
+	msgBytes = make([]byte, msgSize)
+	_, err = io.ReadFull(stream, msgBytes)
+	if err != nil {
+		ui.printDbg("Error receiving message on control channel. Error: %v", err)
+		return
+	}
+	ethrMsg = decodeMsg(msgBytes)
+	return
+}
+
 func recvSessionMsg(conn net.Conn) (ethrMsg *EthrMsg) {
 	ethrMsg = &EthrMsg{}
 	ethrMsg.Type = EthrInv
@@ -345,6 +371,26 @@ func recvSessionMsg(conn net.Conn) (ethrMsg *EthrMsg) {
 func recvSessionMsgFromBuffer(msgBytes []byte) (ethrMsg *EthrMsg) {
 	ethrMsg = decodeMsg(msgBytes)
 	return
+}
+
+func sendSessionMsgQUIC(stream quic.Stream, ethrMsg *EthrMsg) (err error) {
+	msgBytes, err := encodeMsg(ethrMsg)
+	if err != nil {
+		ui.printDbg("Error sending message on control channel. Message: %v, Error: %v", ethrMsg, err)
+		return
+	}
+	msgSize := len(msgBytes)
+	tempBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(tempBuf[0:], uint32(msgSize))
+	_, err = stream.Write(tempBuf)
+	if err != nil {
+		ui.printDbg("Error sending message on control channel. Message: %v, Error: %v", ethrMsg, err)
+	}
+	_, err = stream.Write(msgBytes)
+	if err != nil {
+		ui.printDbg("Error sending message on control channel. Message: %v, Error: %v", ethrMsg, err)
+	}
+	return err
 }
 
 func sendSessionMsg(conn net.Conn, ethrMsg *EthrMsg) (err error) {

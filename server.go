@@ -6,8 +6,16 @@
 package main
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
+	"github.com/lucas-clemente/quic-go"
 	"io"
+	"math/big"
 	"net"
 	"os"
 	"runtime"
@@ -35,6 +43,29 @@ func showAcceptedIPVersion() {
 		ipVerString = "ipv6"
 	}
 	ui.printMsg("Accepting IP version: %s", ipVerString)
+}
+
+func genTLSConfig() *tls.Config {
+	key, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		panic(err)
+	}
+	template := x509.Certificate{SerialNumber: big.NewInt(1)}
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		panic(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		panic(err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+		NextProtos:   []string{"quic-ethr"},
+	}
 }
 
 func runServer(serverParam ethrServerParam) {
@@ -69,6 +100,20 @@ func handshakeWithClient(test *ethrTest, conn net.Conn) (testID EthrTestID, clie
 	clientParam = ethrMsg.Syn.ClientParam
 	ethrMsg = createAckMsg()
 	err = sendSessionMsg(conn, ethrMsg)
+	return
+}
+
+func quicHandshakeWithClient(test *ethrTest, stream quic.Stream) (testID EthrTestID, clientParam EthrClientParam, err error) {
+	ethrMsg := recvSessionMsgQUIC(stream)
+	if ethrMsg.Type != EthrSyn {
+		ui.printDbg("Failed to receive SYN message from client.")
+		err = os.ErrInvalid
+		return
+	}
+	testID = ethrMsg.Syn.TestID
+	clientParam = ethrMsg.Syn.ClientParam
+	ethrMsg = createAckMsg()
+	err = sendSessionMsgQUIC(stream, ethrMsg)
 	return
 }
 
@@ -201,6 +246,176 @@ func srvrRunTCPLatencyTest(test *ethrTest, clientParam EthrClientParam, conn net
 				return
 			}
 			_, err = io.ReadFull(conn, bytes)
+			if err != nil {
+				ui.printDbg("Error receiving data for latency test: %v", err)
+				return
+			}
+			e2 := time.Since(s1)
+			latencyNumbers[i] = e2
+		}
+		sum := int64(0)
+		for _, d := range latencyNumbers {
+			sum += d.Nanoseconds()
+		}
+		elapsed := time.Duration(sum / int64(rttCount))
+		sort.SliceStable(latencyNumbers, func(i, j int) bool {
+			return latencyNumbers[i] < latencyNumbers[j]
+		})
+		//
+		// Special handling for rttCount == 1. This prevents negative index
+		// in the latencyNumber index. The other option is to use
+		// roundUpToZero() but that is more expensive.
+		//
+		rttCountFixed := rttCount
+		if rttCountFixed == 1 {
+			rttCountFixed = 2
+		}
+		atomic.SwapUint64(&test.testResult.latency, uint64(elapsed.Nanoseconds()))
+		avg := elapsed
+		min := latencyNumbers[0]
+		max := latencyNumbers[rttCount-1]
+		p50 := latencyNumbers[((rttCountFixed*50)/100)-1]
+		p90 := latencyNumbers[((rttCountFixed*90)/100)-1]
+		p95 := latencyNumbers[((rttCountFixed*95)/100)-1]
+		p99 := latencyNumbers[((rttCountFixed*99)/100)-1]
+		p999 := latencyNumbers[uint64(((float64(rttCountFixed)*99.9)/100)-1)]
+		p9999 := latencyNumbers[uint64(((float64(rttCountFixed)*99.99)/100)-1)]
+		ui.emitLatencyResults(
+			test.session.remoteIP,
+			protoToString(test.testID.Protocol),
+			avg, min, max, p50, p90, p95, p99, p999, p9999)
+	}
+}
+
+func srvrRunQUICServer() error {
+	l, err := quic.ListenAddr(gLocalIP+":"+gEthrPortStr, genTLSConfig(), nil)
+	if err != nil {
+		return err
+	}
+	defer l.Close()
+	for {
+		conn, err := l.Accept(context.Background())
+		if err != nil {
+			ui.printErr("Error accepting new TCP connection: %v", err)
+			continue
+		}
+		go srvrHandleNewQUICSession(conn)
+	}
+}
+
+func srvrHandleNewQUICSession(sess quic.Session) {
+	server, port, err := net.SplitHostPort(sess.RemoteAddr().String())
+	ethrUnused(server, port)
+	if err != nil {
+		ui.printDbg("RemoteAddr: Split host port failed: %v", err)
+		return
+	}
+	lserver, lport, err := net.SplitHostPort(sess.LocalAddr().String())
+	if err != nil {
+		ui.printDbg("LocalAddr: Split host port failed: %v", err)
+		return
+	}
+	ethrUnused(lserver, lport)
+	ui.printDbg("New connection from %v, port %v to %v, port %v", server, port, lserver, lport)
+
+	stream, err := sess.AcceptStream(context.Background())
+	if err != nil {
+		ui.printErr("Error accepting new QUIC stream: %v", err)
+		return
+	}
+	defer stream.Close()
+
+	test, isNew := createOrGetTest(server, TCP, All)
+	if test == nil {
+		return
+	}
+	if isNew {
+		ui.emitTestHdr()
+	}
+
+	isCPSorPing := true
+	// For CPS and Ping tests, there is no deterministic way to know when the test starts
+	// from the client side and when it ends. This defer function ensures that test is not
+	// created/deleted repeatedly by doing a deferred deletion. If another connection
+	// comes with-in 2s, then another reference would be taken on existing test object
+	// and it won't be deleted by safeDeleteTest call. This also ensures, test header is
+	// not printed repeatedly via emitTestHdr.
+	// Note: Similar mechanism is used in UDP tests to handle test lifetime as well.
+	defer func() {
+		if isCPSorPing {
+			time.Sleep(2 * time.Second)
+		}
+		safeDeleteTest(test)
+	}()
+
+	// Always increment CPS count and then check if the test is Bandwidth etc. and handle
+	// those cases as well.
+	atomic.AddUint64(&test.testResult.cps, 1)
+
+	testID, clientParam, err := quicHandshakeWithClient(test, stream)
+	if err != nil {
+		ui.printDbg("Failed in handshake with the client. Error: %v", err)
+		return
+	}
+	isCPSorPing = false
+	if testID.Protocol == TCP {
+		if testID.Type == Bandwidth {
+			srvrRunQUICBandwidthTest(test, clientParam, stream)
+		} else if testID.Type == Latency {
+			ui.emitLatencyHdr()
+			srvrRunQUICLatencyTest(test, clientParam, stream)
+		}
+	}
+}
+
+func srvrRunQUICBandwidthTest(test *ethrTest, clientParam EthrClientParam, stream quic.Stream) {
+	size := clientParam.BufferSize
+	buff := make([]byte, size)
+	for i := uint32(0); i < size; i++ {
+		buff[i] = byte(i)
+	}
+	bufferLen := len(buff)
+	totalBytesToSend := test.clientParam.BwRate
+	sentBytes := uint64(0)
+	start, waitTime, bytesToSend := beginThrottle(totalBytesToSend, bufferLen)
+	for {
+		n := 0
+		var err error
+		if clientParam.Reverse {
+			n, err = stream.Write(buff[:bytesToSend])
+		} else {
+			n, err = stream.Read(buff)
+		}
+		if err != nil {
+			ui.printDbg("Error sending/receiving data on a connection for bandwidth test: %v", err)
+			break
+		}
+		atomic.AddUint64(&test.testResult.bw, uint64(size))
+		if clientParam.Reverse {
+			sentBytes += uint64(n)
+			start, waitTime, sentBytes, bytesToSend = enforceThrottle(start, waitTime, totalBytesToSend, sentBytes, bufferLen)
+		}
+	}
+}
+
+func srvrRunQUICLatencyTest(test *ethrTest, clientParam EthrClientParam, stream quic.Stream) {
+	bytes := make([]byte, clientParam.BufferSize)
+	rttCount := clientParam.RttCount
+	latencyNumbers := make([]time.Duration, rttCount)
+	for {
+		_, err := io.ReadFull(stream, bytes)
+		if err != nil {
+			ui.printDbg("Error receiving data for latency test: %v", err)
+			return
+		}
+		for i := uint32(0); i < rttCount; i++ {
+			s1 := time.Now()
+			_, err = stream.Write(bytes)
+			if err != nil {
+				ui.printDbg("Error sending data for latency test: %v", err)
+				return
+			}
+			_, err = io.ReadFull(stream, bytes)
 			if err != nil {
 				ui.printDbg("Error receiving data for latency test: %v", err)
 				return
