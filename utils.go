@@ -20,6 +20,8 @@ import (
 var gLocalIP = ""
 var gEthrPort = uint16(8888)
 var gEthrPortStr = ""
+var gEthrQUICPort = uint16(8889)
+var gEthrQUICPortStr = ""
 var gClientPort = uint16(0)
 var gTOS = uint8(0)
 var gTTL = uint8(0)

@@ -87,6 +87,12 @@ func runServer(serverParam ethrServerParam) {
 		fmt.Printf("Fatal error running TCP server: %v\n", err)
 		os.Exit(1)
 	}
+	err = srvrRunQUICServer()
+	if err != nil {
+		finiServer()
+		fmt.Printf("Fatal error running QUIC server: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 func handshakeWithClient(test *ethrTest, conn net.Conn) (testID EthrTestID, clientParam EthrClientParam, err error) {
@@ -288,7 +294,7 @@ func srvrRunTCPLatencyTest(test *ethrTest, clientParam EthrClientParam, conn net
 }
 
 func srvrRunQUICServer() error {
-	l, err := quic.ListenAddr(gLocalIP+":"+gEthrPortStr, genTLSConfig(), nil)
+	l, err := quic.ListenAddr(gLocalIP+":"+gEthrQUICPortStr, genTLSConfig(), nil)
 	if err != nil {
 		return err
 	}

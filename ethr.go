@@ -52,6 +52,7 @@ func main() {
 	use4 := flag.Bool("4", false, "")
 	use6 := flag.Bool("6", false, "")
 	port := flag.Int("port", 8888, "")
+	quicPort := flag.Int("qport", 8889, "")
 	ip := flag.String("ip", "", "")
 	// Server
 	isServer := flag.Bool("s", false, "")
@@ -160,6 +161,8 @@ func main() {
 	}
 	gEthrPort = uint16(*port)
 	gEthrPortStr = fmt.Sprintf("%d", gEthrPort)
+	gEthrQUICPort = uint16(*quicPort)
+	gEthrQUICPortStr = fmt.Sprintf("%d", gEthrQUICPort)
 
 	logFileName := *outputFile
 	if !*noOutput {
