@@ -75,6 +75,7 @@ func runServer(serverParam ethrServerParam) {
 	fmt.Println("-----------------------------------------------------------")
 	showAcceptedIPVersion()
 	ui.printMsg("Listening on port %d for TCP & UDP", gEthrPort)
+	ui.printMsg("Listening on port %d for QUIC", gEthrQUICPort)
 	err := srvrRunUDPServer()
 	if err != nil {
 		finiServer()
